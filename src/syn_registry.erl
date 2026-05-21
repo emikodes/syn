@@ -73,23 +73,15 @@ subcluster_nodes(Scope) ->
 
 -spec lookup(Scope :: atom(), Name :: term()) -> {pid(), Meta :: term()} | undefined.
 lookup(Scope, Name) ->
-    case syn_backbone:get_table_name(syn_registry_by_name, Scope) of
-        undefined ->
-            error({invalid_scope, Scope});
-
-        TableByName ->
-            case find_registry_entry_by_name(Name, TableByName) of
+    TableByName = syn_backbone:get_table_name(syn_registry_by_name, Scope),
+    TableByPid = syn_backbone:get_table_name(syn_registry_by_pid, Scope),
+    case {TableByName, TableByPid} of
+        {undefined, _} -> error({invalid_scope, Scope});
+        {_, undefined} -> error({invalid_scope, Scope});
+        _ ->
+            case find_registry_entry_by_name(Name, TableByName, TableByPid) of
                 undefined -> undefined;
                 {Name, Pid, Meta, _, _, Node} ->
-                    % This read can be initiated prior to registration, by a
-                    % supervisor or supervisor-like process trying to restart a
-                    % stopped process in response to a 'DOWN', while the 'DOWN'
-                    % handler in this module is yet to update TableByName.
-                    %
-                    % Verifying aliveness avoids confusing already_started
-                    % errors while restarting registered processes.
-                    % The aliveness check is only necessary when the Pid is
-                    % local.
                     case Node =:= node() andalso not is_process_alive(Pid) of
                         true -> undefined;
                         false -> {Pid, Meta}
@@ -107,16 +99,14 @@ register(Scope, Name, Pid, Meta) ->
 -spec update(Scope :: atom(), Name :: term(), Fun :: function()) ->
     {ok, {Pid :: pid(), Meta :: term()}} | {error, Reason :: term()}.
 update(Scope, Name, Fun) ->
-    case syn_backbone:get_table_name(syn_registry_by_name, Scope) of
-        undefined ->
-            error({invalid_scope, Scope});
-
-        TableByName ->
-            % get process' node
-            case find_registry_entry_by_name(Name, TableByName) of
-                undefined ->
-                    {error, undefined};
-
+    TableByName = syn_backbone:get_table_name(syn_registry_by_name, Scope),
+    TableByPid = syn_backbone:get_table_name(syn_registry_by_pid, Scope),
+    case {TableByName, TableByPid} of
+        {undefined, _} -> error({invalid_scope, Scope});
+        {_, undefined} -> error({invalid_scope, Scope});
+        _ ->
+            case find_registry_entry_by_name(Name, TableByName, TableByPid) of
+                undefined -> {error, undefined};
                 {Name, Pid, _, _, _, _} ->
                     register_or_update(Scope, Name, Pid, Fun)
             end
@@ -157,20 +147,22 @@ register_or_update(Scope, Name, Pid, MetaOrFun) ->
 
 -spec unregister(Scope :: atom(), Name :: term()) -> ok | {error, Reason :: term()}.
 unregister(Scope, Name) ->
-    case syn_backbone:get_table_name(syn_registry_by_name, Scope) of
-        undefined ->
-            error({invalid_scope, Scope});
-
-        TableByName ->
+    TableByName = syn_backbone:get_table_name(syn_registry_by_name, Scope),
+    TableByPid = syn_backbone:get_table_name(syn_registry_by_pid, Scope),
+    
+    case {TableByName, TableByPid} of
+        {undefined, _} -> error({invalid_scope, Scope});
+        {_, undefined} -> error({invalid_scope, Scope});
+        _ ->
             % get process' node
-            case find_registry_entry_by_name(Name, TableByName) of
+            case find_registry_entry_by_name(Name, TableByName, TableByPid) of
                 undefined ->
                     {error, undefined};
 
                 {Name, Pid, Meta, _, _, _} ->
                     Node = node(Pid),
                     case syn_gen_scope:call(?MODULE, Node, Scope, {'3.0', unregister_on_node, node(), Name, Pid}) of
-                        {ok, TableByPid} when Node =/= node() ->
+                        {ok, _RemoteTableByPid} when Node =/= node() ->
                             %% remove table on caller node immediately so that subsequent calls have an updated registry
                             remove_from_local_table(Name, Pid, TableByName, TableByPid),
                             %% callback
@@ -205,7 +197,7 @@ count(Scope, Node) ->
 
         TableByName ->
             ets:select_count(TableByName, [{
-                {'_', '_', '_', '_', '_', Node},
+                {'_', '_', '_', '_', Node},
                 [],
                 [true]
             }])
@@ -247,7 +239,7 @@ handle_call({'3.0', register_or_update_on_node, RequesterNode, Name, Pid, MetaOr
 } = State) ->
     case is_process_alive(Pid) of
         true ->
-            case find_registry_entry_by_name(Name, TableByName) of
+            case find_registry_entry_by_name(Name, TableByName, TableByPid) of
                 undefined when is_function(MetaOrFun) ->
                     {reply, {error, undefined}, State};
 
@@ -297,7 +289,7 @@ handle_call({'3.0', unregister_on_node, RequesterNode, Name, Pid}, _From, #state
     table_by_name = TableByName,
     table_by_pid = TableByPid
 } = State) ->
-    case find_registry_entry_by_name(Name, TableByName) of
+    case find_registry_entry_by_name(Name, TableByName, TableByPid) of
         undefined ->
             {reply, {error, undefined}, State};
 
@@ -346,7 +338,7 @@ handle_info({'3.0', sync_unregister, Name, Pid, Meta, Reason}, #state{
     table_by_name = TableByName,
     table_by_pid = TableByPid
 } = State) ->
-    case find_registry_entry_by_name(Name, TableByName) of
+    case find_registry_entry_by_name(Name, TableByName, TableByPid) of
         {_, Pid, _, _, _, _} ->
             remove_from_local_table(Name, Pid, TableByName, TableByPid),
             %% callback
@@ -391,8 +383,11 @@ handle_info(Info, #state{scope = Scope} = State) ->
 %% Data callbacks
 %% ----------------------------------------------------------------------------------------------------------
 -spec get_local_data(#state{}) -> {ok, Data :: term()} | undefined.
-get_local_data(#state{table_by_name = TableByName}) ->
-    {ok, get_registry_tuples_for_node(node(), TableByName)}.
+get_local_data(#state{
+    table_by_name = TableByName,
+    table_by_pid = TableByPid
+}) ->
+    {ok, get_registry_tuples_for_node(node(), TableByName, TableByPid)}.
 
 -spec save_remote_data(RemoteNode :: node(), RemoteData :: term(), #state{}) -> any().
 save_remote_data(RemoteNode, RegistryTuplesOfRemoteNode, #state{scope = Scope} = State) ->
@@ -415,7 +410,7 @@ purge_local_data_for_node(Node, #state{
 %% ===================================================================
 -spec rebuild_monitors(Scope :: atom(), TableByName :: atom(), TableByPid :: atom()) -> ok.
 rebuild_monitors(Scope, TableByName, TableByPid) ->
-    RegistryTuples = get_registry_tuples_for_node(node(), TableByName),
+    RegistryTuples = get_registry_tuples_for_node(node(), TableByName, TableByPid),
     do_rebuild_monitors(RegistryTuples, #{}, Scope, TableByName, TableByPid).
 
 -spec do_rebuild_monitors(
@@ -434,13 +429,11 @@ do_rebuild_monitors([{Name, Pid, Meta, Time} | T], NewMRefs, Scope, TableByName,
                 error ->
                     MRef = erlang:monitor(process, Pid),
                     add_to_local_table(Name, Pid, Meta, Time, MRef, TableByName, TableByPid),
-                    do_rebuild_monitors(T, maps:put(Pid, MRef, NewMRefs), Scope, TableByName, TableByPid);
-
+                    do_rebuild_monitors(T, maps:put(Pid, MRef, NewMRefs), Scope, TableByName, TableByPid);        
                 {ok, MRef} ->
                     add_to_local_table(Name, Pid, Meta, Time, MRef, TableByName, TableByPid),
                     do_rebuild_monitors(T, NewMRefs, Scope, TableByName, TableByPid)
             end;
-
         _ ->
             %% process died meanwhile, callback locally
             %% the remote callbacks will have been called when the scope process crash triggered them
@@ -488,20 +481,28 @@ do_register_on_node(Name, Pid, PreviousMeta, Meta, MRef, Reason, RequesterNode, 
     %% return
     {reply, {ok, {CallbackMethod, PreviousMeta, Meta, Time, TableByName, TableByPid}}, State}.
 
--spec get_registry_tuples_for_node(Node :: node(), TableByName :: atom()) -> [syn_registry_tuple()].
-get_registry_tuples_for_node(Node, TableByName) ->
-    ets:select(TableByName, [{
-        {'$1', '$2', '$3', '$4', '_', Node},
-        [],
-        [{{'$1', '$2', '$3', '$4'}}]
-    }]).
+-spec get_registry_tuples_for_node(Node :: node(), TableByName :: atom(), TableByPid :: atom()) -> [syn_registry_tuple()].
+get_registry_tuples_for_node(TargetNode, TableByName, TableByPid) ->
+    ets:foldl(fun
+        ({Name, Pid, Time, _MRef, Node}, Acc) when Node =:= TargetNode ->
+            case lists:keyfind(Name, 2, ets:lookup(TableByPid, Pid)) of
+                {_, _, Meta, _, _, _} -> [{Name, Pid, Meta, Time} | Acc];
+                _ -> Acc
+            end;
+        (_, Acc) -> Acc
+    end, [], TableByName).
 
--spec find_registry_entry_by_name(Name :: term(), TableByName :: atom()) ->
-    Entry :: syn_registry_entry() | undefined.
-find_registry_entry_by_name(Name, TableByName) ->
+-spec find_registry_entry_by_name(Name :: term(), TableByName :: atom(), TableByPid :: atom()) -> Entry :: tuple() | undefined.
+find_registry_entry_by_name(Name, TableByName, TableByPid) ->
     case ets:lookup(TableByName, Name) of
         [] -> undefined;
-        [Entry] -> Entry
+        [{Name, Pid, Time, MRef, Node}] ->
+            PidTuples = ets:lookup(TableByPid, Pid),
+            case lists:keyfind(Name, 2, PidTuples) of
+                false -> undefined;                     
+                {Pid, Name, Meta, _Time, _MRef, _Node} ->
+                    {Name, Pid, Meta, Time, MRef, Node}
+            end
     end.
 
 -spec find_registry_entries_by_pid(Pid :: pid(), TableByPid :: atom()) -> RegistryEntriesByPid :: [syn_registry_entry_by_pid()].
@@ -551,7 +552,9 @@ maybe_demonitor(Pid, TableByPid) ->
 ) -> true.
 add_to_local_table(Name, Pid, Meta, Time, MRef, TableByName, TableByPid) ->
     %% insert
-    true = ets:insert(TableByName, {Name, Pid, Meta, Time, MRef, node(Pid)}),
+    %% Remove meta inserion
+    %%true = ets:insert(TableByName, {Name, Pid, Meta, Time, MRef, node(Pid)}),
+    true = ets:insert(TableByName, {Name, Pid, Time, MRef, node(Pid)}),
     %% since we use a table of type bag, we need to manually ensure that the key Pid, Name is unique
     true = ets:match_delete(TableByPid, {Pid, Name, '_', '_', '_', '_'}),
     true = ets:insert(TableByPid, {Pid, Name, Meta, Time, MRef, node(Pid)}).
@@ -563,7 +566,7 @@ add_to_local_table(Name, Pid, Meta, Time, MRef, TableByName, TableByPid) ->
     TableByPid :: atom()
 ) -> true.
 remove_from_local_table(Name, Pid, TableByName, TableByPid) ->
-    true = ets:match_delete(TableByName, {Name, Pid, '_', '_', '_', '_'}),
+    true = ets:match_delete(TableByName, {Name, Pid, '_', '_', '_'}),
     true = ets:match_delete(TableByPid, {Pid, Name, '_', '_', '_', '_'}).
 
 -spec update_local_table(
@@ -587,9 +590,9 @@ update_local_table(Name, PreviousPid, {Pid, Meta, Time, MRef}, TableByName, Tabl
 purge_registry_for_remote_nodes(Scope, TableByName, TableByPid) ->
     LocalNode = node(),
     RemoteNodesWithDoubles = ets:select(TableByName, [{
-        {'_', '_', '_', '_', '_', '$6'},
-        [{'=/=', '$6', LocalNode}],
-        ['$6']
+        {'_', '_', '_', '_','$5'},
+        [{'=/=', '$5', LocalNode}],
+        ['$5']
     }]),
     RemoteNodes = ordsets:from_list(RemoteNodesWithDoubles),
     ordsets:fold(fun(RemoteNode, _) ->
@@ -599,14 +602,14 @@ purge_registry_for_remote_nodes(Scope, TableByName, TableByPid) ->
 -spec purge_registry_for_remote_node(Scope :: atom(), Node :: atom(), TableByName :: atom(), TableByPid :: atom()) -> true.
 purge_registry_for_remote_node(Scope, Node, TableByName, TableByPid) when Node =/= node() ->
     %% loop elements for callback
-    RegistryTuples = get_registry_tuples_for_node(Node, TableByName),
+    RegistryTuples = get_registry_tuples_for_node(Node, TableByName, TableByPid),
     lists:foreach(fun({Name, Pid, Meta, _Time}) ->
         syn_event_handler:call_event_handler(on_process_unregistered,
             [Scope, Name, Pid, Meta, {syn_remote_scope_node_down, Scope, Node}]
         )
     end, RegistryTuples),
     %% remove all from pid table
-    true = ets:match_delete(TableByName, {'_', '_', '_', '_', '_', Node}),
+    true = ets:match_delete(TableByName, {'_', '_', '_', '_', Node}),
     true = ets:match_delete(TableByPid, {'_', '_', '_', '_', '_', Node}).
 
 -spec reconcile_remote_registry_snapshot(Node :: node(), [syn_registry_tuple()], #state{}) -> ok.
@@ -616,7 +619,7 @@ reconcile_remote_registry_snapshot(Node, RegistryTuplesOfRemoteNode, #state{
     table_by_pid = TableByPid
 }) ->
     SnapshotNames = ordsets:from_list([Name || {Name, _Pid, _Meta, _Time} <- RegistryTuplesOfRemoteNode]),
-    ExistingTuples = get_registry_tuples_for_node(Node, TableByName),
+    ExistingTuples = get_registry_tuples_for_node(Node, TableByName, TableByPid),
     lists:foreach(fun({Name, Pid, Meta, _Time}) ->
         case ordsets:is_element(Name, SnapshotNames) of
             true ->
@@ -643,7 +646,7 @@ handle_registry_sync(Name, Pid, Meta, Time, Reason, #state{
     table_by_name = TableByName,
     table_by_pid = TableByPid
 } = State) ->
-    case find_registry_entry_by_name(Name, TableByName) of
+    case find_registry_entry_by_name(Name, TableByName, TableByPid) of
         undefined ->
             %% no conflict
             add_to_local_table(Name, Pid, Meta, Time, undefined, TableByName, TableByPid),

@@ -28,15 +28,22 @@
     ApiCall :: atom(),
     Version :: atom()
 }.
--type syn_registry_entry() :: {
+%%-type syn_registry_entry() :: {
+%%    Name :: term(),
+%%    Pid :: pid(),
+%%    Meta :: term(),
+%%    Time :: integer(),
+%%    MRef :: undefined | reference(),
+%%    Node :: node()
+%%}.
+-type syn_registry_entry() :: { %%Removed duplicated meta information.
     Name :: term(),
     Pid :: pid(),
-    Meta :: term(),
     Time :: integer(),
     MRef :: undefined | reference(),
     Node :: node()
 }.
--type syn_registry_entry_by_pid() :: {
+-type syn_registry_entry_by_pid() :: { %%kept only here (First element of tuple becomes a key in ETS)
     Pid :: pid(),
     Name :: term(),
     Meta :: term(),
